@@ -10,11 +10,14 @@ import sklearn.linear_model
 import sklearn.preprocessing as skp
 import sklearn.pipeline as skpipe
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import RandomizedSearchCV, GridSearchCV
+from sklearn import metrics
 import math
 import statsmodels as sm
 from statsmodels.tsa.ar_model import AutoReg
 import sktime as skt
 from sktime.performance_metrics.forecasting import MeanSquaredError, MeanSquaredPercentageError, RelativeLoss
+import pickle
 
 class FredQD:
     """
@@ -70,7 +73,7 @@ class FredQD:
         if vintage is None:
             url = 'https://files.stlouisfed.org/files/htdocs/fred-md/quarterly/current.csv'
         else:
-            url = f'https://files.stlouisfed.org/files/htdocs/fred-md/quarterly/{vintage}.csv'
+            url = f'c'
         print(url)
         transforms = pd.read_csv(
             url, header=0, nrows=2, index_col=0).transpose().drop(labels="factors", axis=1)
@@ -226,7 +229,7 @@ class FredQD:
         # Save Results
         actual_data[intial_nas] = inital_scalar.inverse_transform(working_data)[
             intial_nas]
-        self.Lambda = None  # TODO: Manipulate pipe to give factor loadings
+        self.Lambda = None
         self.svdmodel = pipe
         self.series_filled = pd.DataFrame(
             actual_data, index=self.series.index, columns=self.series.columns)
@@ -449,9 +452,27 @@ class FredQD:
         self.en_factor = forecasts
 
     @staticmethod
-    def random_forest(Z, y, x):
+    def param_cv_rf(Z, y):
         # define X with Z and factors
-        model = RandomForestRegressor()
+        model = RandomForestRegressor(random_state=42)
+        # cross validation
+        # Maximum number of levels in tree
+        max_depth = [2, 4]
+        # Minimum number of samples required to split a node
+        min_samples_split = [2, 5]
+        # Minimum number of samples required at each leaf node
+        min_samples_leaf = [1, 2]
+        param_grid = {'max_depth': max_depth,
+                      'min_samples_split': min_samples_split,
+                      'min_samples_leaf': min_samples_leaf}
+        rf_Grid = GridSearchCV(estimator=model, param_grid=param_grid, cv=3, verbose=2, n_jobs=4)
+        rf_Grid.fit(Z, y)
+        return rf_Grid.best_params_
+
+    @staticmethod
+    def random_forest(Z, y, x,params):
+        # define X with Z and factors
+        model = RandomForestRegressor(random_state=42)
         model.fit(Z, y)
         return model.predict(x)[0]
 
@@ -459,20 +480,32 @@ class FredQD:
         forecasts = []
         for i in range(16):
             Z, y, x = self.get_prediction_data(i + 1)
-            pred = self.random_forest(Z, y, x)
+            params = self.param_cv_rf(Z, y)
+            pred = self.random_forest(Z, y, x, params)
             forecasts.append(pred)
         self.rf = forecasts
 
     @staticmethod
-    def xgboosting(Z, y, x):
+    def param_cv_xgb(Z, y):
         # define X with Z and factors
-        model = xgb.XGBRegressor(
-            max_depth=2,
-            gamma=2,
-            eta=0.8,
-            reg_alpha=0.5,
-            reg_lambda=0.5
-        )
+        model = model = xgb.XGBRegressor()
+        # cross validation
+        params = {
+            "objective": 'reg:squarederror',
+            "learning_rate": [0.05, 0.10, 0.15, 0.20, 0.25, 0.30],
+            "max_depth": [2, 3, 4, 5, 6, 8, 10, 12, 15],
+            "min_child_weight": [1, 3, 5, 7],
+            "gamma": [0, 0.5, 1, 1.5, 2],
+            "colsample_bytree": [0.3, 0.4, 0.5, 0.7]
+        }
+        xgb_Random = RandomizedSearchCV(estimator=model, param_distributions=params, n_iter=5, n_jobs=-1, cv=3, verbose=3)
+        xgb_Random.fit(Z, y)
+        return xgb_Random.best_params_
+
+    @staticmethod
+    def xgboosting(Z, y, x, params):
+        # define X with Z and factors
+        model = xgb.XGBRegressor(params)
         model.fit(Z, y)
         return model.predict(x)[0]
 
@@ -480,79 +513,89 @@ class FredQD:
         forecasts = []
         for i in range(16):
             Z, y, x = self.get_prediction_data(i + 1)
-            pred = self.xgboosting(Z, y, x)
+            params = self.param_cv_xgb(Z, y)
+            pred = self.xgboosting(Z, y, x, params)
             forecasts.append(pred)
         self.xgboost_forecast = forecasts
 
 #######################################################################################################################
 ##########################################  FAT MODELS   ##############################################################
 #######################################################################################################################
-    def get_fat_prediction_data(self, h):
-        y = self.series_filled['GDPC1'].copy(deep=True)
-        f = self.series_filled.drop(['GDPC1'], axis=1).shift(h)
-        f_1 = f.shift(1)
-        f_2 = f_1.shift(1)
-        f_3 = f_2.shift(1)
-        Z = pd.concat([y, f, f_1, f_2, f_3], axis=1, join='inner')
-        Z['y_lag1'] = Z['GDPC1'].shift(h)
-        Z['y_lag2'] = Z['GDPC1'].shift(h + 1)
-        dates_to_drop = [Z.index[i] for i in range(h + 3)]
-        Z = Z.drop(dates_to_drop, axis=0)
-        Z = Z.drop(['GDPC1'], axis=1)
-        # make prediction vector x
-        x = pd.concat([y, f, f_1, f_2, f_3], axis=1, join='inner')
-        x['y_lag1'] = y
-        x['y_lag2'] = y.shift(1)
-        x = x.drop(['GDPC1'], axis=1)
-        x = x[-2:-1]
-        y_ = y[h + 3:]
-        return Z.values, y_.values, x.values
+    # def get_fat_prediction_data(self, h):
+    #     y = self.series_filled['GDPC1'].copy(deep=True)
+    #     f = self.series_filled.drop(['GDPC1'], axis=1).shift(h)
+    #     f_1 = f.shift(1)
+    #     f_2 = f_1.shift(1)
+    #     f_3 = f_2.shift(1)
+    #     f_4 = f_3.shift(1)
+    #     Z = pd.concat([y, f, f_1, f_2, f_3, f_4], axis=1, join='inner')
+    #     Z['y_lag1'] = Z['GDPC1'].shift(h)
+    #     Z['y_lag2'] = Z['GDPC1'].shift(h + 1)
+    #     dates_to_drop = [Z.index[i] for i in range(h + 4)]
+    #     Z = Z.drop(dates_to_drop, axis=0)
+    #     Z = Z.drop(['GDPC1'], axis=1)
+    #     # make prediction vector x
+    #     x = pd.concat([y, f, f_1, f_2, f_3, f_3], axis=1, join='inner')
+    #     x['y_lag1'] = y
+    #     x['y_lag2'] = y.shift(1)
+    #     x = x.drop(['GDPC1'], axis=1)
+    #     x = x[-2:-1]
+    #     y_ = y[h + 4:]
+    #     return Z.values, y_.values, x.values
+    #
+    # def forecast_fat_en_model(self):
+    #     forecasts = []
+    #     for i in range(16):
+    #         Z, y, x = self.get_fat_prediction_data(i + 1)
+    #         pred = self.en_model(Z, y, x)
+    #         forecasts.append(pred)
+    #     self.fat_en = forecasts
+    #
+    # def forecast_fat_ridge_model(self):
+    #     forecasts = []
+    #     for i in range(16):
+    #         Z, y, x = self.get_fat_prediction_data(i + 1)
+    #         pred = self.ridge_model(Z, y, x)
+    #         forecasts.append(pred)
+    #     self.fat_ridge = forecasts
+    #
+    # def forecast_fat_lasso_model(self):
+    #     forecasts = []
+    #     for i in range(16):
+    #         Z, y, x = self.get_fat_prediction_data(i + 1)
+    #         pred = self.lasso_model(Z, y, x)
+    #         forecasts.append(pred)
+    #     self.fat_lasso = forecasts
+    #
+    # def forecast_fat_rf(self):
+    #     forecasts = []
+    #     for i in range(16):
+    #         Z, y, x = self.get_fat_prediction_data(i + 1)
+    #         pred = self.random_forest(Z, y, x)
+    #         forecasts.append(pred)
+    #     self.fat_rf = forecasts
+    #
+    # def forecast_fat_xgboost(self):
+    #     forecasts = []
+    #     for i in range(16):
+    #         Z, y, x = self.get_prediction_data(i + 1)
+    #         pred = self.xgboosting(Z, y, x)
+    #         forecasts.append(pred)
+    #     self.fat_xgboost_forecast = forecasts
 
-    def forecast_fat_en_model(self):
-        forecasts = []
+    def forecast_model_average(self):
+        averages = []
         for i in range(16):
-            Z, y, x = self.get_fat_prediction_data(i + 1)
-            pred = self.en_model(Z, y, x)
-            forecasts.append(pred)
-        self.fat_en = forecasts
-
-    def forecast_fat_ridge_model(self):
-        forecasts = []
-        for i in range(16):
-            Z, y, x = self.get_fat_prediction_data(i + 1)
-            pred = self.ridge_model(Z, y, x)
-            forecasts.append(pred)
-        self.fat_ridge = forecasts
-
-    def forecast_fat_lasso_model(self):
-        forecasts = []
-        for i in range(16):
-            Z, y, x = self.get_fat_prediction_data(i + 1)
-            pred = self.lasso_model(Z, y, x)
-            forecasts.append(pred)
-        self.fat_lasso = forecasts
-
-    def forecast_fat_rf(self):
-        forecasts = []
-        for i in range(16):
-            Z, y, x = self.get_fat_prediction_data(i + 1)
-            pred = self.random_forest(Z, y, x)
-            forecasts.append(pred)
-        self.fat_rf = forecasts
-
-    def forecast_fat_xgboost(self):
-        forecasts = []
-        for i in range(16):
-            Z, y, x = self.get_prediction_data(i + 1)
-            pred = self.xgboosting(Z, y, x)
-            forecasts.append(pred)
-        self.fat_xgboost_forecast = forecasts
+            average = np.average([self.lasso_factor[i], self.rf[i]])
+            averages.append(average)
+        self.model_average = averages
 
     def forecast_model_average(self):
         averages = []
         for i in range(16):
             average = np.average([self.knn[i], self.ar2[i], self.factor_model_pred[i],
-                       self.en_factor[i], self.ridge_factor[i], self.lasso_factor[i],
+                       self.en_factor[i],
+                        self.ridge_factor[i], self.lasso_factor[i],
                        # self.fat_en[i], self.fat_ridge[i], self.fat_lasso[i],
                        self.rf[i], self.xgboost_forecast[i]])
                        # self.fat_rf[i], self.fat_xgboost_forecast[i]])
@@ -569,13 +612,13 @@ class FredQD:
         self.ridge_forecasts = []
         self.en_forecasts = []
         self.lasso_forecasts = []
-        self.fat_ridge_forecasts = []
-        self.fat_en_forecasts = []
-        self.fat_lasso_forecasts = []
+        # self.fat_ridge_forecasts = []
+        # self.fat_en_forecasts = []
+        # self.fat_lasso_forecasts = []
         self.rf_forecasts = []
         self.xgboost_forecasts = []
-        self.fat_rf_forecasts = []
-        self.fat_xgboost_forecasts = []
+        # self.fat_rf_forecasts = []
+        # self.fat_xgboost_forecasts = []
         self.model_average_forecasts = []
         self.data_copy = self.rawseries.copy(deep=True)
 
@@ -597,20 +640,20 @@ class FredQD:
         self.forecast_lasso_factor_model()
         print('Estimating Factor Ridge')
         self.forecast_ridge_factor_model()
-        print('Estimating Fat EN')
-        self.forecast_fat_en_model()
-        print('Estimating Fat LASSO')
-        self.forecast_fat_lasso_model()
-        print('Estimating Fat Ridge')
-        self.forecast_fat_ridge_model()
+        # print('Estimating Fat EN')
+        # self.forecast_fat_en_model()
+        # print('Estimating Fat LASSO')
+        # self.forecast_fat_lasso_model()
+        # print('Estimating Fat Ridge')
+        # self.forecast_fat_ridge_model()
         print('Estimating Factor RF')
         self.forecast_rf()
         print('Estimating Factor Xgboost')
         self.forecast_xgboost()
-        print('Estimating Fat Random Forest')
-        self.forecast_fat_rf()
-        print('Estimating Fat Xgboost')
-        self.forecast_fat_xgboost()
+        # print('Estimating Fat Random Forest')
+        # self.forecast_fat_rf()
+        # print('Estimating Fat Xgboost')
+        # self.forecast_fat_xgboost()
         print('Making Model Average')
         self.forecast_model_average()
         # append results to list
@@ -622,11 +665,11 @@ class FredQD:
         self.lasso_forecasts.append(self.lasso_factor)
         self.rf_forecasts.append(self.rf)
         self.xgboost_forecasts.append(self.xgboost_forecast)
-        self.fat_ridge_forecasts.append(self.fat_ridge)
-        self.fat_en_forecasts.append(self.fat_en)
-        self.fat_lasso_forecasts.append(self.fat_lasso)
-        self.fat_rf_forecasts.append(self.fat_rf)
-        self.fat_xgboost_forecasts.append(self.fat_xgboost_forecast)
+        # self.fat_ridge_forecasts.append(self.fat_ridge)
+        # self.fat_en_forecasts.append(self.fat_en)
+        # self.fat_lasso_forecasts.append(self.fat_lasso)
+        # self.fat_rf_forecasts.append(self.fat_rf)
+        # self.fat_xgboost_forecasts.append(self.fat_xgboost_forecast)
         self.model_average_forecasts.append(self.model_average)
         # additional info
         self.all_Nfac.append(self.Nfactor)
@@ -635,12 +678,13 @@ class FredQD:
     def forecasts_to_dict(self):
         # self.forecasts = {"AR(2)": self.ar2_forecasts}
         self.forecasts = {"AR(2)": self.ar2_forecasts, "KNN": self.knn_forecasts, "DFM": self.factor_forecasts,
-                          "Factor EN": self.en_forecasts, "Factor Ridge": self.ridge_forecasts,
-                          "Factor Lasso": self.lasso_forecasts, "Model average (above models)": self.model_average_forecasts
-                          "Fat EN": self.en_forecasts,
-                          "Fat Ridge": self.ridge_forecasts,"Fat Lasso": self.lasso_forecasts,
+                          "Factor EN": self.en_forecasts,
+                          "Factor Ridge": self.ridge_forecasts,
+                          "Factor Lasso": self.lasso_forecasts, "Model average (above models)": self.model_average_forecasts,
+                          # "Fat EN": self.en_forecasts,
+                          # "Fat Ridge": self.ridge_forecasts,"Fat Lasso": self.lasso_forecasts,
                           "Factor Random Forests": self.rf_forecasts, "Factor Xgboost": self.xgboost_forecasts,
-                          "Fat Random Forests": self.rf_forecasts, "Fat Xgboost": self.xgboost_forecasts,
+                          # "Fat Random Forests": self.rf_forecasts, "Fat Xgboost": self.xgboost_forecasts,
                           }
 
     # Extract individual series for each model
@@ -657,7 +701,7 @@ class FredQD:
         h8 = [i[7] for i in model_forecasts]
         h9 = [i[8] for i in model_forecasts]
         h10 = [i[9] for i in model_forecasts]
-        h11= [i[10] for i in model_forecasts]
+        h11 = [i[10] for i in model_forecasts]
         h12 = [i[11] for i in model_forecasts]
         h13 = [i[12] for i in model_forecasts]
         h14 = [i[13] for i in model_forecasts]
@@ -690,7 +734,7 @@ class FredQD:
         h14_dates = dates[14:]
         h15_dates = dates[15:]
         h16_dates = dates[16:]
-        assert(len(h8_dates) < len(h1_dates))
+        # assert(len(h8_dates) < len(h1_dates))
         ################################################################################################################
         # Make a df of each horizon:
         # Within loop each model_forecast is a list of forecasts organised by horizon
@@ -715,7 +759,7 @@ class FredQD:
         h15 = pd.DataFrame([model_forecast[14][:len(h15_dates)] for model_name, model_forecast in self.forecasts.items()], index=model_names, columns=h15_dates)
         h16 = pd.DataFrame([model_forecast[15][:len(h16_dates)] for model_name, model_forecast in self.forecasts.items()], index=model_names, columns=h16_dates)
         self.horizon_forecasts = [h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16]
-        self.big_forecast_df = pd.concat(self.horizon_forecasts, axis=1, join='inner')
+        # self.big_forecast_df = pd.concat(self.horizon_forecasts, axis=1, join='inner')
 
     def forecast_recursive(self):
         """
@@ -727,12 +771,18 @@ class FredQD:
         for i in self.data_copy.index.tolist():
             if i >= self.start_date:
                 print(f"Forecasting 1Q-16Q ahead from {i}")
-                # estimates models and forecasts h=[1,...,8] with data up to date i
+                # estimates models and forecasts h=[1,...,16] with data up to date i
                 self.estimate_models(i)
+                pickle_out = open("fred_qd_unfinished_forecasts.pickle", "wb")
+                pickle.dump(self, pickle_out)
+                pickle_out.close()
         # store in dicts
         self.forecasts_to_dict()
         self.forecasts_to_dfs()
         # print(self.horizon_forecasts)
+        pickle_out = open("fred_qd_no_eval.pickle", "wb")
+        pickle.dump(self, pickle_out)
+        pickle_out.close()
 
     def evaluate_models(self):
         from sktime.performance_metrics.forecasting import mean_squared_error, MeanAbsoluteError
@@ -788,17 +838,70 @@ class FredQD:
         self.mspe = pd.concat(mspe, axis=1, join='inner')
         self.mae = pd.concat(mae, axis=1, join='inner')
 
+    def verbose_evaluate_models(self):
+        from sktime.performance_metrics.forecasting import mean_squared_error, MeanAbsoluteError
+        start_date_index = self.series_filled.index.to_list().index(self.start_date)
+        rmse = []
+        mse = []
+        relative_loss = []
+        mspe = []
+        mae = []
+        horizon = 0
+        for h in self.horizon_forecasts:
+            horizon += 1
+            start_date_index += 1
+            y_true = self.series_filled['GDPC1'][start_date_index:]
+            horizon_mse = []
+            horizon_rmse = []
+            horizon_rl = []
+            horizon_mspe = []
+            horizon_mae = []
+            for model_name in h.index:
+                model = h.loc[model_name]
+                benchmark = h.loc['AR(2)']
+                mse_ = MeanSquaredError(multioutput='  ', square_root=False)
+                rmse_ = MeanSquaredError(multioutput='uniform_average', square_root=True)
+                rl = RelativeLoss(relative_loss_function=mean_squared_error)
+                mspe_ = MeanSquaredPercentageError(multioutput='uniform_average')
+                mae_ = MeanAbsoluteError(multioutput='uniform_average')
+                if len(model) != 0:
+                    mse__ = mse_(y_true, model)
+                    rmse__ = rmse_(y_true, model)
+                    rl_ = rl(y_true, model, y_pred_benchmark=benchmark)
+                    mspe__ = mspe_(y_true, model)
+                    mae__ = mae_(y_true, model)
+                    # append
+                    horizon_mse.append(mse__)
+                    horizon_rmse.append(rmse__)
+                    horizon_rl.append(rl_)
+                    horizon_mspe.append(mspe__)
+                    horizon_mae.append(mae__)
+            horizon_mse_df = pd.DataFrame(horizon_mse, index=self.forecasts.keys(), columns=[f"h={horizon}"])
+            horizon_rmse_df = pd.DataFrame(horizon_rmse, index=self.forecasts.keys(), columns=[f"h={horizon}"])
+            horizon_rl_df = pd.DataFrame(horizon_rl, index=self.forecasts.keys(), columns=[f"h={horizon}"])
+            horizon_mspe_df = pd.DataFrame(horizon_mspe, index=self.forecasts.keys(), columns=[f"h={horizon}"])
+            horizon_rmae_df = pd.DataFrame(horizon_mae, index=self.forecasts.keys(), columns=[f"h={horizon}"])
+            mse.append(horizon_mse_df)
+            rmse.append(horizon_rmse_df)
+            relative_loss.append(horizon_rl_df)
+            mspe.append(horizon_mspe_df)
+            mae.append(horizon_rmae_df)
 
 if __name__ == '__main__':
     # Initiate FredQD and estimate current factors
-    fqd = FredQD(start_date="1990-03-01")
-    # fqd.estimate_factors()
-    # f = fqd.factors
-    # print(f)
+    fqd = FredQD(start_date="1980-03-01")
     fqd.forecast_recursive()
-    # print(fqd.forecasts)
-    # for horizon in fqd.rmse_dfs:
-    #     for model in horizon:
-    #         print(model)
     fqd.evaluate_models()
-    print(fqd.rmse)
+    print("1980 RESULTS: ", fqd.rmse)
+    pickle_out = open("fred_qd_nofat.pickle", "wb")
+    pickle.dump(fqd, pickle_out)
+    pickle_out.close()
+
+    fqd = FredQD(start_date="1990-03-01")
+    fqd.forecast_recursive()
+    fqd.evaluate_models()
+    print("1990 RESULTS: ", fqd.rmse)
+    pickle_out = open("fred_qd_1990.pickle", "wb")
+    pickle.dump(fqd, pickle_out)
+    pickle_out.close()
+
