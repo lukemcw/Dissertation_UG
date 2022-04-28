@@ -28,7 +28,6 @@ class FredQD:
     2) estimate_factors(): Runs the full FRED factor estimation for one period
     3) factors_em(): Estimates factors with the EM algorithm to handle missing observations
     4) baing(): Estimates the Bai-Ng factor selection alogrithm
-    5) apply_transforms(): Apply the transform to each series
     6) remove_outliers(): Removes Outliers
     7) factor_standardizer_method(): Converts standard_method to appropiate sklearn.StandardScaler
     8) data_transforms(): Applies function to series to make data stationary as given by transform code
@@ -70,18 +69,14 @@ class FredQD:
 
     @staticmethod
     def download_data(vintage):
-        if vintage is None:
-            url = 'https://files.stlouisfed.org/files/htdocs/fred-md/quarterly/current.csv'
-        else:
-            url = f'c'
-        print(url)
+        FILE='current_canada.csv'
         transforms = pd.read_csv(
-            url, header=0, nrows=2, index_col=0).transpose().drop(labels="factors", axis=1)
+            FILE, header=0, nrows=2, index_col=0).transpose().drop(labels="factors", axis=1)
         transforms.index.rename("series", inplace=True)
         transforms.columns = ['transform']
         # transforms.drop([transforms.index[178], transforms.index[180]], axis=0)
         transforms = transforms.to_dict()['transform']
-        data = pd.read_csv(url, names=list(transforms.keys()), skiprows=3, index_col=0,
+        data = pd.read_csv(FILE, names=list(transforms.keys()), skiprows=3, index_col=0,
                            skipfooter=2, engine='python', parse_dates=True, infer_datetime_format=True)
         # data.drop([data.columns[178], data.columns[180]], axis=1)
         # data.index = data.index.to_period("Q")
@@ -139,14 +134,6 @@ class FredQD:
         else:
             raise ValueError("Transform must be in [1, 2, ..., 7]")
 
-    def apply_transforms(self):
-        """
-        Apply the transformation to each series to make them stationary and drop the first 2 rows that are mostly NaNs
-        Save results to self.series
-        """
-        self.series = pd.DataFrame({key: self.data_transforms(
-            self.rawseries[key], value) for (key, value) in self.transforms.items()})
-        self.series.drop(self.series.index[[0, 1]], inplace=True)
 
     def remove_outliers(self):
         """
@@ -301,7 +288,6 @@ class FredQD:
         Runs estimation routine.
         If number of factors is not specified then estimate the number to be used
         """
-        self.apply_transforms()
         self.remove_outliers()
         self.baing()
         self.factors_em()
